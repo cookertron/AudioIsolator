@@ -2,11 +2,24 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import subprocess
 import os
+import sys
 import threading
 import math
 import torch
 import torchaudio
 import json
+import gc
+
+# Environment Setup
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# Add sam-audio to path
+curr_dir = os.path.dirname(os.path.abspath(__file__))
+sam_audio_path = os.path.join(curr_dir, "sam-audio")
+if sam_audio_path not in sys.path:
+    sys.path.append(sam_audio_path)
+
 # Import SAM Audio - handling potential import errors gracefully to allow GUI to open even if imports fail
 try:
     from sam_audio import SAMAudio, SAMAudioProcessor
@@ -21,6 +34,7 @@ class SoundIsolatorApp:
         self.root = root
         self.root.title("Sound Isolator")
         self.root.geometry("600x450")
+        self.root.protocol("WM_DELETE_WINDOW", self.cleanup_and_exit)
         
         # Styles
         self.bg_color = "#f0f0f0"
@@ -35,8 +49,10 @@ class SoundIsolatorApp:
         self.processor = None
         
         self.model_var = tk.StringVar()
+        self.model_var = tk.StringVar()
         self.prompt_source = tk.StringVar(value="preset")
         self.preset_var = tk.StringVar()
+        self.stop_processing = False
         
         # UI Setup
         self.create_widgets()
@@ -68,12 +84,12 @@ class SoundIsolatorApp:
 
     def scan_models(self):
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        checkpoints_dir = os.path.join(base_dir, "checkpoints")
+        models_dir = os.path.join(base_dir, "models")
         
         models = []
-        if os.path.exists(checkpoints_dir):
-            for name in os.listdir(checkpoints_dir):
-                full_path = os.path.join(checkpoints_dir, name)
+        if os.path.exists(models_dir):
+            for name in os.listdir(models_dir):
+                full_path = os.path.join(models_dir, name)
                 if os.path.isdir(full_path):
                     # Basic check for config.json to confirm it's likely a model
                     if os.path.exists(os.path.join(full_path, "config.json")):
@@ -127,10 +143,24 @@ class SoundIsolatorApp:
         self.toggle_inputs()
 
         # 4. Action Section
-        self.process_btn = tk.Button(self.root, text="ISOLATE SOUND", command=self.start_processing_thread, 
+        action_frame = tk.Frame(self.root, bg=self.bg_color)
+        action_frame.pack(pady=10)
+
+        self.process_btn = tk.Button(action_frame, text="ISOLATE SOUND", command=self.start_processing_thread, 
                                      font=("Segoe UI", 12, "bold"), bg="#4CAF50", fg="white", 
-                                     state="disabled", height=2, width=20)
-        self.process_btn.pack(pady=20)
+                                     state="disabled", height=2, width=15)
+        self.process_btn.pack(side="left", padx=10)
+
+        self.stop_btn = tk.Button(action_frame, text="STOP", command=self.stop_processing_action,
+                                  font=("Segoe UI", 12, "bold"), bg="#f44336", fg="white",
+                                  state="disabled", height=2, width=10)
+        self.stop_btn.pack(side="left", padx=10)
+
+        # Exit Button
+        exit_btn = tk.Button(action_frame, text="EXIT", command=self.cleanup_and_exit,
+                             font=("Segoe UI", 12, "bold"), bg="#9E9E9E", fg="white", 
+                             height=2, width=10)
+        exit_btn.pack(side="left", padx=10)
 
         # 5. Feedback Section (Bottom)
         # Status Label (Very Bottom)
@@ -168,6 +198,20 @@ class SoundIsolatorApp:
         if file_path:
             self.video_path.set(file_path)
 
+    def clear_gpu_memory(self):
+        # Release references to models if they exist
+        if hasattr(self, 'model'):
+            del self.model
+            self.model = None
+        if hasattr(self, 'processor'):
+            del self.processor
+            self.processor = None
+            
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            gc.collect()
+
     def start_loading_thread(self):
         if self.model_loaded:
             messagebox.showinfo("Info", "Model is already loaded.")
@@ -181,6 +225,10 @@ class SoundIsolatorApp:
 
     def load_model(self):
         try:
+            self.model_loaded = False
+            # 0. Clear Memory first
+            self.clear_gpu_memory()
+
             # 1. Setup
             selected_model_name = self.model_var.get()
             if selected_model_name == "No models found!":
@@ -191,7 +239,7 @@ class SoundIsolatorApp:
             self.update_progress(0, "determinate")
             
             base_dir = os.path.dirname(os.path.abspath(__file__))
-            checkpoint_path = os.path.join(base_dir, "checkpoints", selected_model_name)
+            checkpoint_path = os.path.join(base_dir, "models", selected_model_name)
             
             model_id = checkpoint_path
             is_local = True # Always local with new logic
@@ -206,6 +254,15 @@ class SoundIsolatorApp:
                 config_path = os.path.join(model_id, "config.json")
                 with open(config_path, "r") as f:
                     config_dict = json.load(f)
+                
+                # OPTIMIZATION: Disable rankers to save memory!
+                # These are only used if reranking_candidates > 1.
+                # Disabling them saves ~4-7GB VRAM (ImageBind + CLAP/Judge).
+                if 'visual_ranker' in config_dict:
+                     config_dict['visual_ranker'] = None
+                if 'text_ranker' in config_dict:
+                     config_dict['text_ranker'] = None
+                     
                 config = SAMAudioConfig(**config_dict)
             else:
                 # Fallback to standard loading for remote models (simpler)
@@ -239,11 +296,17 @@ class SoundIsolatorApp:
                 self.update_status("Applying weights to model...")
                 self.update_progress(70)
                 self.model.load_state_dict(state_dict, strict=True)
+                
+                # Free memory of loaded dict immediately
+                del state_dict
+                gc.collect() 
             
             # 7. Move to Device
             if torch.cuda.is_available():
                 self.update_status("Moving model to CUDA...")
                 self.update_progress(80)
+                # Empty cache before allocation attempt
+                torch.cuda.empty_cache()
                 self.model = self.model.eval().cuda()
                 self.update_status("Model loaded on CUDA.")
             else:
@@ -287,8 +350,10 @@ class SoundIsolatorApp:
             return
 
         self.process_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
         # Pass prompt explicitly or set it to the variable used by run_process
         self.sound_characteristic.set(prompt) # Ensure the variable holds the correct value
+        self.stop_processing = False
         
         thread = threading.Thread(target=self.run_process)
         thread.daemon = True
@@ -339,6 +404,10 @@ class SoundIsolatorApp:
             residual_chunks = []
             
             for i in range(num_chunks):
+                if self.stop_processing:
+                    self.update_status("Processing stopped by user.")
+                    return
+
                 start = i * samples_per_chunk
                 end = min((i + 1) * samples_per_chunk, total_samples)
                 
@@ -445,7 +514,19 @@ class SoundIsolatorApp:
             messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
         finally:
             self.process_btn.config(state="normal")
+            self.stop_btn.config(state="disabled")
             
+    def stop_processing_action(self):
+        if self.process_btn['state'] == 'disabled': # Only if running
+            self.stop_processing = True
+            self.update_status("Stopping...")
+
+    def cleanup_and_exit(self):
+        self.stop_processing = True
+        self.update_status("Cleaning up memory...")
+        self.clear_gpu_memory()
+        self.root.destroy()
+        
     def update_status(self, text):
         self.status_var.set(text)
         self.root.update_idletasks()
