@@ -43,7 +43,7 @@ A Python GUI application for isolating specific sounds (vocals, music, etc.) fro
 3.  **Process**: Select your video and target sound, then click "Isolate Sound".
 
 ## Models
-The application requires model checkpoints to run. Create a `checkpoints` folder and download models into subfolders (e.g., `checkpoints/sam-audio-large/`).
+The application requires model checkpoints to run. Create a `models` folder and download models into subfolders (e.g., `models/sam-audio-large/`).
 
 **Download Links:**
 - [SAM-Audio Small](https://huggingface.co/facebook/sam-audio-small)
@@ -53,3 +53,10 @@ The application requires model checkpoints to run. Create a `checkpoints` folder
 ## Requirements
 - Python 3.10+ (Tested on 3.12)
 - CUDA-capable GPU recommended (but works on CPU)
+
+> **Note on First Run**:
+> When you load the model for the first time, it will automatically download several dependencies:
+> - **ImageBind** (~4GB)
+> - **T5 Text Encoder** (~1GB)
+>
+> This is normal. These files are saved to `.checkpoints` or your system cache and reused for all models (Small/Base/Large), so you won't need to download them again.
